@@ -1,61 +1,77 @@
-// @flow
+/**
+ * @prettier
+ * @flow
+ */
 
 import _ from 'lodash';
-import {allow} from '../../middleware';
-import {DIST_TAGS, filter_tarball_urls, get_version, ErrorCode} from '../../../lib/utils';
-import type {Router} from 'express';
-import type {Config} from '@verdaccio/types';
-import type {IAuth, $ResponseExtend, $RequestExtend, $NextFunctionVer, IStorageHandler} from '../../../../types';
+import { allow } from '../../middleware';
+import { convertDistRemoteToLocalTarballUrls, getVersion, ErrorCode } from '../../../lib/utils';
+import { HEADERS, DIST_TAGS, API_ERROR } from '../../../lib/constants';
+import type { Router } from 'express';
+import type { Config } from '@verdaccio/types';
+import type { IAuth, $ResponseExtend, $RequestExtend, $NextFunctionVer, IStorageHandler } from '../../../../types';
+
+const downloadStream = (packageName: string, filename: string, storage: any, req: $RequestExtend, res: $ResponseExtend) => {
+  const stream = storage.getTarball(packageName, filename);
+
+  stream.on('content-length', function(content) {
+    res.header('Content-Length', content);
+  });
+  stream.on('error', function(err) {
+    return res.report_error(err);
+  });
+
+  res.header(HEADERS.CONTENT_TYPE, HEADERS.OCTET_STREAM);
+  stream.pipe(res);
+};
 
 export default function(route: Router, auth: IAuth, storage: IStorageHandler, config: Config) {
   const can = allow(auth);
   // TODO: anonymous user?
   route.get('/:package/:version?', can('access'), function(req: $RequestExtend, res: $ResponseExtend, next: $NextFunctionVer) {
-    const getPackageMetaCallback = function(err, info) {
+    const getPackageMetaCallback = function(err, metadata) {
       if (err) {
         return next(err);
       }
-      info = filter_tarball_urls(info, req, config);
+      metadata = convertDistRemoteToLocalTarballUrls(metadata, req, config.url_prefix);
 
       let queryVersion = req.params.version;
       if (_.isNil(queryVersion)) {
-        return next(info);
+        return next(metadata);
       }
 
-      let t = get_version(info, queryVersion);
-      if (_.isNil(t) === false) {
-        return next(t);
+      let version = getVersion(metadata, queryVersion);
+      if (_.isNil(version) === false) {
+        return next(version);
       }
 
-      if (_.isNil(info[DIST_TAGS]) === false) {
-        if (_.isNil(info[DIST_TAGS][queryVersion]) === false) {
-          queryVersion = info[DIST_TAGS][queryVersion];
-          t = get_version(info, queryVersion);
-          if (_.isNil(t) === false) {
-            return next(t);
+      if (_.isNil(metadata[DIST_TAGS]) === false) {
+        if (_.isNil(metadata[DIST_TAGS][queryVersion]) === false) {
+          queryVersion = metadata[DIST_TAGS][queryVersion];
+          version = getVersion(metadata, queryVersion);
+          if (_.isNil(version) === false) {
+            return next(version);
           }
         }
       }
-      return next(ErrorCode.get404('version not found: ' + req.params.version));
+      return next(ErrorCode.getNotFound(`${API_ERROR.VERSION_NOT_EXIST}: ${req.params.version}`));
     };
 
     storage.getPackage({
       name: req.params.package,
+      uplinksLook: true,
       req,
       callback: getPackageMetaCallback,
     });
   });
 
-  route.get('/:package/-/:filename', can('access'), function(req: $RequestExtend, res: $ResponseExtend) {
-    const stream = storage.getTarball(req.params.package, req.params.filename);
+  route.get('/:scopedPackage/-/:scope/:filename', can('access'), function(req: $RequestExtend, res: $ResponseExtend) {
+    const { scopedPackage, filename } = req.params;
 
-    stream.on('content-length', function(content) {
-      res.header('Content-Length', content);
-    });
-    stream.on('error', function(err) {
-      return res.report_error(err);
-    });
-    res.header('Content-Type', 'application/octet-stream');
-    stream.pipe(res);
+    downloadStream(scopedPackage, filename, storage, req, res);
+  });
+
+  route.get('/:package/-/:filename', can('access'), function(req: $RequestExtend, res: $ResponseExtend) {
+    downloadStream(req.params.package, req.params.filename, storage, req, res);
   });
 }

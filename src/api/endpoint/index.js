@@ -1,7 +1,10 @@
-// @flow
+/**
+ * @prettier
+ * @flow
+ */
 
-import type {IAuth, IStorageHandler} from '../../../types';
-import type {Config} from '@verdaccio/types';
+import type { IAuth, IStorageHandler } from '../../../types';
+import type { Config } from '@verdaccio/types';
 
 import express from 'express';
 import bodyParser from 'body-parser';
@@ -12,8 +15,10 @@ import distTags from './api/dist-tags';
 import publish from './api/publish';
 import search from './api/search';
 import pkg from './api/package';
+import stars from './api/stars';
+import profile from './api/v1/profile';
 
-const {match, validate_name, validatePackage, encodeScopePackage, anti_loop} = require('../middleware');
+const { match, validateName, validatePackage, encodeScopePackage, antiLoop } = require('../middleware');
 
 export default function(config: Config, auth: IAuth, storage: IStorageHandler) {
   /* eslint new-cap:off */
@@ -25,11 +30,11 @@ export default function(config: Config, auth: IAuth, storage: IStorageHandler) {
   // $FlowFixMe
   app.param('package', validatePackage);
   // $FlowFixMe
-  app.param('filename', validate_name);
-  app.param('tag', validate_name);
-  app.param('version', validate_name);
-  app.param('revision', validate_name);
-  app.param('token', validate_name);
+  app.param('filename', validateName);
+  app.param('tag', validateName);
+  app.param('version', validateName);
+  app.param('revision', validateName);
+  app.param('token', validateName);
 
   // these can't be safely put into express url for some reason
   // TODO: For some reason? what reason?
@@ -37,20 +42,21 @@ export default function(config: Config, auth: IAuth, storage: IStorageHandler) {
   app.param('org_couchdb_user', match(/^org\.couchdb\.user:/));
   app.param('anything', match(/.*/));
 
-  app.use(auth.basic_middleware());
-  // app.use(auth.bearer_middleware())
-  app.use(bodyParser.json({strict: false, limit: config.max_body_size || '10mb'}));
-  app.use(anti_loop(config));
+  app.use(auth.apiJWTmiddleware());
+  app.use(bodyParser.json({ strict: false, limit: config.max_body_size || '10mb' }));
+  app.use(antiLoop(config));
   // encode / in a scoped package name to be matched as a single parameter in routes
   app.use(encodeScopePackage);
   // for "npm whoami"
   whoami(app);
   pkg(app, auth, storage, config);
+  profile(app, auth);
   search(app, auth, storage);
-  user(app, auth);
+  user(app, auth, config);
   distTags(app, auth, storage);
   publish(app, auth, storage, config);
   ping(app);
+  stars(app, storage);
 
   return app;
 }

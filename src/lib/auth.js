@@ -1,20 +1,35 @@
-// @flow
+/**
+ * @prettier
+ * @flow
+ */
 
-import {loadPlugin} from '../lib/plugin-loader';
-import Crypto from 'crypto';
-import jwt from 'jsonwebtoken';
-import {ErrorCode} from './utils';
-const Error = require('http-errors');
+import _ from 'lodash';
 
-import type {Config, Logger, Callback} from '@verdaccio/types';
-import type {$Response, NextFunction} from 'express';
-import type {$RequestExtend} from '../../types';
+import { API_ERROR, SUPPORT_ERRORS, TOKEN_BASIC, TOKEN_BEARER } from './constants';
+import loadPlugin from '../lib/plugin-loader';
+import { aesEncrypt, signPayload } from './crypto-utils';
+import {
+  getDefaultPlugins,
+  getMiddlewareCredentials,
+  verifyJWTPayload,
+  createAnonymousRemoteUser,
+  isAuthHeaderValid,
+  getSecurity,
+  isAESLegacy,
+  parseAuthTokenHeader,
+  parseBasicPayload,
+  createRemoteUser,
+} from './auth-utils';
+import { convertPayloadToBase64, ErrorCode } from './utils';
+import { getMatchedPackagesSpec } from './config-utils';
+
+import type { Config, Logger, Callback, IPluginAuth, RemoteUser, JWTSignOptions, Security, AuthPluginPackage } from '@verdaccio/types';
+import type { $Response, NextFunction } from 'express';
+import type { $RequestExtend, IAuth } from '../../types';
 
 const LoggerApi = require('./logger');
-/**
- * Handles the authentification, load auth plugins.
- */
-class Auth {
+
+class Auth implements IAuth {
   config: Config;
   logger: Logger;
   secret: string;
@@ -22,66 +37,68 @@ class Auth {
 
   constructor(config: Config) {
     this.config = config;
-    this.logger = LoggerApi.logger.child({sub: 'auth'});
+    this.logger = LoggerApi.logger.child({ sub: 'auth' });
     this.secret = config.secret;
     this.plugins = this._loadPlugin(config);
     this._applyDefaultPlugins();
   }
 
   _loadPlugin(config: Config) {
-    const plugin_params = {
+    const pluginOptions = {
       config,
       logger: this.logger,
     };
 
-    return loadPlugin(config, config.auth, plugin_params, function(p) {
-      return p.authenticate || p.allow_access || p.allow_publish;
+    return loadPlugin(config, config.auth, pluginOptions, (plugin: IPluginAuth) => {
+      const { authenticate, allow_access, allow_publish } = plugin;
+
+      return authenticate || allow_access || allow_publish;
     });
   }
 
   _applyDefaultPlugins() {
-    const allow_action = function(action) {
-      return function(user, pkg, cb) {
-        let ok = pkg[action].reduce(function(prev, curr) {
-          if (user.name === curr || user.groups.indexOf(curr) !== -1) return true;
-          return prev;
-        }, false);
-
-        if (ok) return cb(null, true);
-
-        if (user.name) {
-          cb(ErrorCode.get403('user ' + user.name + ' is not allowed to ' + action + ' package ' + pkg.name));
-        } else {
-          cb(ErrorCode.get403('unregistered users are not allowed to ' + action + ' package ' + pkg.name));
-        }
-      };
-    };
-
-    this.plugins.push({
-      authenticate: function(user, password, cb) {
-        cb(ErrorCode.get403('bad username/password, access denied'));
-      },
-
-      add_user: function(user, password, cb) {
-        return cb(ErrorCode.get409('bad username/password, access denied'));
-      },
-
-      allow_access: allow_action('access'),
-      allow_publish: allow_action('publish'),
-    });
+    this.plugins.push(getDefaultPlugins());
   }
 
-  authenticate(user: string, password: string, cb: Callback) {
-    const plugins = this.plugins.slice(0)
-    ;(function next() {
-      let p = plugins.shift();
+  changePassword(username: string, password: string, newPassword: string, cb: Callback) {
+    const validPlugins = _.filter(this.plugins, plugin => _.isFunction(plugin.changePassword));
 
-      if (typeof(p.authenticate) !== 'function') {
+    if (_.isEmpty(validPlugins)) {
+      return cb(ErrorCode.getInternalError(SUPPORT_ERRORS.PLUGIN_MISSING_INTERFACE));
+    }
+
+    for (const plugin of validPlugins) {
+      this.logger.trace({ username }, 'updating password for @{username}');
+      plugin.changePassword(username, password, newPassword, (err, profile) => {
+        if (err) {
+          this.logger.error(
+            { username, err },
+            `An error has been produced 
+          updating the password for @{username}. Error: @{err.message}`
+          );
+          return cb(err);
+        }
+
+        this.logger.trace({ username }, 'updated password for @{username} was successful');
+        return cb(null, profile);
+      });
+    }
+  }
+
+  authenticate(username: string, password: string, cb: Callback) {
+    const plugins = this.plugins.slice(0);
+    const self = this;
+    (function next() {
+      const plugin = plugins.shift();
+
+      if (_.isFunction(plugin.authenticate) === false) {
         return next();
       }
 
-      p.authenticate(user, password, function(err, groups) {
+      self.logger.trace({ username }, 'authenticating @{username}');
+      plugin.authenticate(username, password, function(err, groups) {
         if (err) {
+          self.logger.trace({ username, err }, 'authenticating for user @{username} failed. Error: @{err.message}');
           return cb(err);
         }
 
@@ -94,10 +111,16 @@ class Auth {
         // Info: Cannot use `== false to check falsey values`
         if (!!groups && groups.length !== 0) {
           // TODO: create a better understanding of expectations
-          if (typeof groups === 'string') {
-            throw new TypeError('invalid type for function');
+          if (_.isString(groups)) {
+            throw new TypeError('plugin group error: invalid type for function');
           }
-          return cb(err, authenticatedUser(user, groups));
+          const isGroupValid: boolean = _.isArray(groups);
+          if (!isGroupValid) {
+            throw new TypeError(API_ERROR.BAD_FORMAT_USER_GROUP);
+          }
+
+          self.logger.trace({ username, groups }, 'authentication for user @{username} was successfully. Groups: @{groups}');
+          return cb(err, createRemoteUser(username, groups));
         }
         next();
       });
@@ -105,24 +128,27 @@ class Auth {
   }
 
   add_user(user: string, password: string, cb: Callback) {
-    let self = this;
-    let plugins = this.plugins.slice(0)
+    const self = this;
+    const plugins = this.plugins.slice(0);
+    this.logger.trace({ user }, 'add user @{user}');
 
-    ;(function next() {
-      let p = plugins.shift();
-      let n = 'adduser';
-      if (typeof(p[n]) !== 'function') {
-        n = 'add_user';
+    (function next() {
+      const plugin = plugins.shift();
+      let method = 'adduser';
+      if (_.isFunction(plugin[method]) === false) {
+        method = 'add_user';
       }
-      if (typeof(p[n]) !== 'function') {
+      if (_.isFunction(plugin[method]) === false) {
         next();
       } else {
         // p.add_user() execution
-        p[n](user, password, function(err, ok) {
+        plugin[method](user, password, function(err, ok) {
           if (err) {
+            self.logger.trace({ user, err }, 'the user @{user} could not being added. Error: @{err}');
             return cb(err);
           }
           if (ok) {
+            self.logger.trace({ user }, 'the user @{user} has been added');
             return self.authenticate(user, password, cb);
           }
           next();
@@ -134,25 +160,28 @@ class Auth {
   /**
    * Allow user to access a package.
    */
-  allow_access(packageName: string, user: string, callback: Callback) {
-    let plugins = this.plugins.slice(0);
+  allow_access({ packageName, packageVersion }: AuthPluginPackage, user: RemoteUser, callback: Callback) {
+    const plugins = this.plugins.slice(0);
     // $FlowFixMe
-    let pkg = Object.assign({name: packageName}, this.config.getMatchedPackagesSpec(packageName));
+    const pkg = Object.assign({ name: packageName, version: packageVersion }, getMatchedPackagesSpec(packageName, this.config.packages));
+    const self = this;
+    this.logger.trace({ packageName }, 'allow access for @{packageName}');
 
     (function next() {
-      let p = plugins.shift();
+      const plugin = plugins.shift();
 
-      if (typeof(p.allow_access) !== 'function') {
+      if (_.isFunction(plugin.allow_access) === false) {
         return next();
       }
 
-      p.allow_access(user, pkg, function(err, ok) {
-
+      plugin.allow_access(user, pkg, function(err, ok: boolean) {
         if (err) {
+          self.logger.trace({ packageName, err }, 'forbidden access for @{packageName}. Error: @{err.message}');
           return callback(err);
         }
 
         if (ok) {
+          self.logger.trace({ packageName }, 'allowed access for @{packageName}');
           return callback(null, ok);
         }
 
@@ -161,44 +190,83 @@ class Auth {
     })();
   }
 
+  allow_unpublish({ packageName, packageVersion }: AuthPluginPackage, user: string, callback: Callback) {
+    // $FlowFixMe
+    const pkg = Object.assign({ name: packageName, version: packageVersion }, getMatchedPackagesSpec(packageName, this.config.packages));
+    this.logger.trace({ packageName }, 'allow unpublish for @{packageName}');
+
+    for (const plugin of this.plugins) {
+      if (_.isFunction(plugin.allow_unpublish) === false) {
+        continue;
+      } else {
+        plugin.allow_unpublish(user, pkg, (err, ok: boolean) => {
+          if (err) {
+            this.logger.trace({ packageName }, 'forbidden publish for @{packageName}, it will fallback on unpublish permissions');
+            return callback(err);
+          }
+
+          if (_.isNil(ok) === true) {
+            this.logger.trace({ packageName }, 'we bypass unpublish for @{packageName}, publish will handle the access');
+            return this.allow_publish(...arguments);
+          }
+
+          if (ok) {
+            this.logger.trace({ packageName }, 'allowed unpublish for @{packageName}');
+            return callback(null, ok);
+          }
+        });
+      }
+    }
+  }
+
   /**
    * Allow user to publish a package.
    */
-  allow_publish(packageName: string, user: string, callback: Callback) {
-    let plugins = this.plugins.slice(0);
+  allow_publish({ packageName, packageVersion }: AuthPluginPackage, user: string, callback: Callback) {
+    const plugins = this.plugins.slice(0);
+    const self = this;
     // $FlowFixMe
-    let pkg = Object.assign({name: packageName}, this.config.getMatchedPackagesSpec(packageName));
+    const pkg = Object.assign({ name: packageName, version: packageVersion }, getMatchedPackagesSpec(packageName, this.config.packages));
+    this.logger.trace({ packageName }, 'allow publish for @{packageName}');
 
     (function next() {
-      let p = plugins.shift();
+      const plugin = plugins.shift();
 
-      if (typeof(p.allow_publish) !== 'function') {
+      if (_.isFunction(plugin.allow_publish) === false) {
         return next();
       }
 
-      p.allow_publish(user, pkg, function(err, ok) {
-        if (err) return callback(err);
-        if (ok) return callback(null, ok);
+      plugin.allow_publish(user, pkg, (err, ok: boolean) => {
+        if (err) {
+          self.logger.trace({ packageName }, 'forbidden publish for @{packageName}');
+          return callback(err);
+        }
+
+        if (ok) {
+          self.logger.trace({ packageName }, 'allowed publish for @{packageName}');
+          return callback(null, ok);
+        }
         next(); // cb(null, false) causes next plugin to roll
       });
     })();
   }
 
-  /**
-   * Set up a basic middleware.
-   * @return {Function}
-   */
-  basic_middleware() {
-    let self = this;
-    let credentials;
-    return function(req: $RequestExtend, res: $Response, _next: NextFunction) {
+  apiJWTmiddleware() {
+    const plugins = this.plugins.slice(0);
+    const helpers = { createAnonymousRemoteUser, createRemoteUser };
+    for (const plugin of plugins) {
+      if (plugin.apiJWTmiddleware) {
+        return plugin.apiJWTmiddleware(helpers);
+      }
+    }
+
+    return (req: $RequestExtend, res: $Response, _next: NextFunction) => {
       req.pause();
 
       const next = function(err) {
         req.resume();
         // uncomment this to reject users with bad auth headers
         // return _next.apply(null, arguments)
-
         // swallow error, user remains unauthorized
         // set remoteUserError to indicate that user was attempting authentication
         if (err) {
@@ -207,227 +275,163 @@ class Auth {
         return _next();
       };
 
-      if (req.remote_user != null && req.remote_user.name !== undefined) {
-        return next();
-      }
-      req.remote_user = buildAnonymousUser();
-
-      let authorization = req.headers.authorization;
-      if (authorization == null) {
+      if (this._isRemoteUserMissing(req.remote_user)) {
         return next();
       }
 
-      let parts = authorization.split(' ');
+      // in case auth header does not exist we return anonymous function
+      req.remote_user = createAnonymousRemoteUser();
 
-      if (parts.length !== 2) {
-        return next( ErrorCode.get400('bad authorization header') );
+      const { authorization } = req.headers;
+      if (_.isNil(authorization)) {
+        return next();
       }
 
-      const scheme = parts[0];
-      if (scheme === 'Basic') {
-         credentials = new Buffer(parts[1], 'base64').toString();
-      } else if (scheme === 'Bearer') {
-         credentials = self.aes_decrypt(new Buffer(parts[1], 'base64')).toString('utf8');
-        if (!credentials) {
-          return next();
-        }
+      if (!isAuthHeaderValid(authorization)) {
+        this.logger.trace('api middleware auth heather is not valid');
+        return next(ErrorCode.getBadRequest(API_ERROR.BAD_AUTH_HEADER));
+      }
+
+      const security: Security = getSecurity(this.config);
+      const { secret } = this.config;
+
+      if (isAESLegacy(security)) {
+        this.logger.trace('api middleware using legacy auth token');
+        this._handleAESMiddleware(req, security, secret, authorization, next);
       } else {
-        return next();
+        this.logger.trace('api middleware using JWT auth token');
+        this._handleJWTAPIMiddleware(req, security, secret, authorization, next);
       }
+    };
+  }
 
-      const index = credentials.indexOf(':');
-      if (index < 0) {
-        return next();
-      }
-
-      const user = credentials.slice(0, index);
-      const pass = credentials.slice(index + 1);
-
-      self.authenticate(user, pass, function(err, user) {
+  _handleJWTAPIMiddleware(req: $RequestExtend, security: Security, secret: string, authorization: string, next: Function) {
+    const { scheme, token } = parseAuthTokenHeader(authorization);
+    if (scheme.toUpperCase() === TOKEN_BASIC.toUpperCase()) {
+      // this should happen when client tries to login with an existing user
+      const credentials = convertPayloadToBase64(token).toString();
+      const { user, password } = (parseBasicPayload(credentials): any);
+      this.authenticate(user, password, (err, user) => {
         if (!err) {
           req.remote_user = user;
           next();
         } else {
-          req.remote_user = buildAnonymousUser();
+          req.remote_user = createAnonymousRemoteUser();
           next(err);
         }
       });
-    };
+    } else {
+      // jwt handler
+      const credentials: any = getMiddlewareCredentials(security, secret, authorization);
+      if (credentials) {
+        // if the signature is valid we rely on it
+        req.remote_user = credentials;
+        next();
+      } else {
+        // with JWT throw 401
+        next(ErrorCode.getForbidden(API_ERROR.BAD_USERNAME_PASSWORD));
+      }
+    }
   }
 
-  /**
-   * Set up the bearer middleware.
-   * @return {Function}
-   */
-  bearer_middleware() {
-    let self = this;
-    return function(req: $RequestExtend, res: $Response, _next: NextFunction) {
-      req.pause();
-      const next = function(_err) {
-        req.resume();
-        /* eslint prefer-spread: "off" */
-        /* eslint prefer-rest-params: "off" */
-        return _next.apply(null, arguments);
-      };
+  _handleAESMiddleware(req: $RequestExtend, security: Security, secret: string, authorization: string, next: Function) {
+    const credentials: any = getMiddlewareCredentials(security, secret, authorization);
+    if (credentials) {
+      const { user, password } = credentials;
+      this.authenticate(user, password, (err, user) => {
+        if (!err) {
+          req.remote_user = user;
+          next();
+        } else {
+          req.remote_user = createAnonymousRemoteUser();
+          next(err);
+        }
+      });
+    } else {
+      // we force npm client to ask again with basic authentication
+      return next(ErrorCode.getBadRequest(API_ERROR.BAD_AUTH_HEADER));
+    }
+  }
 
-      if (req.remote_user != null && req.remote_user.name !== undefined) {
-        return next();
-      }
-      req.remote_user = buildAnonymousUser();
-
-      let authorization = req.headers.authorization;
-      if (authorization == null) {
-        return next();
-      }
-
-      let parts = authorization.split(' ');
-
-      if (parts.length !== 2) {
-        return next( ErrorCode.get400('bad authorization header') );
-      }
-
-      let scheme = parts[0];
-      let token = parts[1];
-
-      if (scheme !== 'Bearer') {
-        return next();
-      }
-      let user;
-      try {
-        user = self.decode_token(token);
-      } catch(err) {
-        return next(err);
-      }
-
-      req.remote_user = authenticatedUser(user.u, user.g);
-      // $FlowFixMe
-      req.remote_user.token = token;
-      next();
-    };
+  _isRemoteUserMissing(remote_user: RemoteUser): boolean {
+    return _.isUndefined(remote_user) === false && _.isUndefined(remote_user.name) === false;
   }
 
   /**
    * JWT middleware for WebUI
    */
-  jwtMiddleware() {
+  webUIJWTmiddleware() {
     return (req: $RequestExtend, res: $Response, _next: NextFunction) => {
-      if (req.remote_user !== null && req.remote_user.name !== undefined) {
-       return _next();
+      if (this._isRemoteUserMissing(req.remote_user)) {
+        return _next();
       }
 
       req.pause();
-      const next = function(_err) {
+      const next = err => {
         req.resume();
+        if (err) {
+          // req.remote_user.error = err.message;
+          res.status(err.statusCode).send(err.message);
+        }
+
         return _next();
       };
 
-      const token = (req.headers.authorization || '').replace('Bearer ', '');
+      const { authorization } = req.headers;
+      if (_.isNil(authorization)) {
+        return next();
+      }
+
+      if (!isAuthHeaderValid(authorization)) {
+        return next(ErrorCode.getBadRequest(API_ERROR.BAD_AUTH_HEADER));
+      }
+
+      const token = (authorization || '').replace(`${TOKEN_BEARER} `, '');
       if (!token) {
         return next();
       }
 
-      let decoded;
+      let credentials;
       try {
-        decoded = this.decode_token(token);
+        credentials = verifyJWTPayload(token, this.config.secret);
       } catch (err) {
-       // FIXME: intended behaviour, do we want it?
+        // FIXME: intended behaviour, do we want it?
       }
 
-      if (decoded) {
-        req.remote_user = authenticatedUser(decoded.user, decoded.group);
+      if (credentials) {
+        const { name, groups } = credentials;
+        // $FlowFixMe
+        req.remote_user = createRemoteUser(name, groups);
       } else {
-        req.remote_user = buildAnonymousUser();
+        req.remote_user = createAnonymousRemoteUser();
       }
 
       next();
     };
   }
 
-  /**
-   * Generates the token.
-   * @param {object} user
-   * @param {string} expire_time
-   * @return {string}
-   */
-  issue_token(user: any, expire_time: string) {
-    return jwt.sign(
-      {
-        user: user.name,
-        group: user.real_groups && user.real_groups.length ? user.real_groups : undefined,
-      },
-      this.secret,
-      {
-        notBefore: '1000', // Make sure the time will not rollback :)
-        expiresIn: expire_time || '7d',
-      }
-    );
-  }
+  async jwtEncrypt(user: RemoteUser, signOptions: JWTSignOptions): string {
+    const { real_groups, name, groups } = user;
+    const realGroupsValidated = _.isNil(real_groups) ? [] : real_groups;
+    const groupedGroups = _.isNil(groups) ? real_groups : groups.concat(realGroupsValidated);
+    const payload: RemoteUser = {
+      real_groups: realGroupsValidated,
+      name,
+      groups: groupedGroups,
+    };
 
-  /**
-   * Decodes the token.
-   * @param {*} token
-   * @return {Object}
-   */
-  decode_token(token: string) {
-    let decoded;
-    try {
-      decoded = jwt.verify(token, this.secret);
-    } catch (err) {
-      throw Error[401](err.message);
-    }
+    const token: string = await signPayload(payload, this.secret, signOptions);
 
-    return decoded;
+    // $FlowFixMe
+    return token;
   }
 
   /**
    * Encrypt a string.
    */
-  aes_encrypt(buf: Buffer): Buffer {
-    const c = Crypto.createCipher('aes192', this.secret);
-    const b1 = c.update(buf);
-    const b2 = c.final();
-    return Buffer.concat([b1, b2]);
+  aesEncrypt(buf: Buffer): Buffer {
+    return aesEncrypt(buf, this.secret);
   }
-
-  /**
-    * Dencrypt a string.
-   */
-  aes_decrypt(buf: Buffer ) {
-    try {
-      const c = Crypto.createDecipher('aes192', this.secret);
-      const b1 = c.update(buf);
-      const b2 = c.final();
-      return Buffer.concat([b1, b2]);
-    } catch(_) {
-      return new Buffer(0);
-    }
-  }
-}
-
-/**
- * Builds an anonymous user in case none is logged in.
- * @return {Object} { name: xx, groups: [], real_groups: [] }
- */
-function buildAnonymousUser() {
-  return {
-    name: undefined,
-    // groups without '$' are going to be deprecated eventually
-    groups: ['$all', '$anonymous', '@all', '@anonymous'],
-    real_groups: [],
-  };
-}
-
-/**
- * Authenticate an user.
- * @return {Object} { name: xx, groups: [], real_groups: [] }
- */
-function authenticatedUser(name: string, groups: Array<any>) {
-  let _groups = (groups || []).concat(['$all', '$authenticated', '@all', '@authenticated', 'all']);
-  return {
-    name: name,
-    groups: _groups,
-    real_groups: groups,
-  };
 }
 
 export default Auth;

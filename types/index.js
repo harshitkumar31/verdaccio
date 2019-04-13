@@ -1,118 +1,163 @@
 // @flow
 
 import type {
-	UpLinkConf,
-	Callback,
-	Versions,
-	Version,
-	MergeTags,
-	Config,
-	Logger,
-	Package} from '@verdaccio/types';
+  IBasicAuth,
+  IBasicStorage,
+  IStorageManager,
+  UpLinkConf,
+  Callback,
+  Versions,
+  Version,
+  RemoteUser,
+  Config,
+  Logger,
+  JWTSignOptions,
+  PackageAccess,
+  StringValue as verdaccio$StringValue,
+  Package} from '@verdaccio/types';
 import type {
-	IUploadTarball,
-	IReadTarball,
+  IReadTarball,
 } from '@verdaccio/streams';
 import type {ILocalData} from '@verdaccio/local-storage';
+import lunrMutable from 'lunr-mutable-indexes';
 import type {NextFunction, $Request, $Response} from 'request';
 
-export type StringValue = string | void | null;
+export type StringValue = verdaccio$StringValue;
 
-export interface IAuth {
-	config: Config;
-	logger: Logger;
-	secret: string;
-	plugins: Array<any>;
-	aes_encrypt(buf: Buffer): Buffer;
-	basic_middleware(): $NextFunctionVer;
-	jwtMiddleware(): $NextFunctionVer;
-	authenticate(user: string, password: string, cb: Callback): void;
-	allow_access(packageName: string, user: string, callback: Callback): void;
-	issue_token(user: string, time: string): string;
-	add_user(user: string, password: string, cb: Callback): any;
+export type StartUpConfig = {
+  storage: string;
+  plugins?: string;
+  self_path: string;
 }
 
-export interface IWebSearch {
-	index: any;
-	storage: IStorageHandler;
-	query(query: string): any;
-	add(pkg: Version): void;
-	remove(name: string): void;
-	reindex(): void;
-	configureStorage(storage: IStorageHandler): void;
+export type MatchedPackage = PackageAccess | void;
+
+export type JWTPayload = RemoteUser & {
+  password?: string;
 }
 
-export interface IProxy {
-	config: UpLinkConf;
-	failed_requests: number;
-	userAgent: string;
-	ca?: string | void;
-	logger: Logger;
-	server_id: string;
-	url: any;
-	maxage: number;
-	timeout: number;
-	max_fails: number;
-	fail_timeout: number;
-	upname: string;
-	fetchTarball(url: string): IReadTarball;
-	isUplinkValid(url: string): boolean;
+export type AESPayload = {
+  user: string;
+  password: string;
 }
+
+export type AuthTokenHeader = {
+  scheme: string;
+  token: string;
+}
+
+export type BasicPayload = AESPayload | void;
+export type AuthMiddlewarePayload = RemoteUser | BasicPayload;
 
 export type ProxyList = {
-	[key: string]: IProxy | null;
+  [key: string]: IProxy;
+}
+
+export type CookieSessionToken = {
+  expires: Date;
 }
 
 export type Utils = {
-	ErrorCode: any;
-	getLatestVersion: Callback;
-	isObject: (value: any) => boolean;
-	validate_name: (value: any) => boolean;
-	tag_version: (value: any, version: string, tag: string) => void;
-	normalize_dist_tags: (pkg: Package) => void;
-	semverSort: (keys: Array<string>) => Array<string>;
+  ErrorCode: any;
+  getLatestVersion: Callback;
+  isObject: (value: any) => boolean;
+  validate_name: (value: any) => boolean;
+  tag_version: (value: any, version: string, tag: string) => void;
+  normalizeDistTags: (pkg: Package) => void;
+  semverSort: (keys: Array<string>) => Array<string>;
 }
 
-export interface IStorageHandler {
-	config: Config;
-	localStorage: IStorage;
-	logger: Logger;
-	uplinks: ProxyList;
-	addPackage(name: string, metadata: any, callback: Function): void;
-	addVersion(name: string, version: string, metadata: Version, tag: StringValue, callback: Callback): void;
-	mergeTags(name: string, tagHash: MergeTags, callback: Callback): void;
-	replaceTags(name: string, tagHash: MergeTags, callback: Callback): void;
-	changePackage(name: string, metadata: Package, revision: string, callback: Callback): void;
-	removePackage(name: string, callback: Callback): void;
-	removeTarball(name: string, filename: string, revision: string, callback: Callback): void;
-	addTarball(name: string, filename: string): IUploadTarball;
-	getTarball(name: string, filename: string): IReadTarball;
-	getPackage(options: any): void;
-	search(startkey: string, options: any): void;
-	getLocalDatabase(callback: Callback): void;
-	_syncUplinksMetadata(name: string, packageInfo: Package, options: any, callback: Callback): void;
-	_updateVersionsHiddenUpLink(versions: Versions, upLink: IProxy): void;
-	_setupUpLinks(config: Config): void;
-}
-
-export interface IStorage {
-	config: Config;
-	localData: ILocalData;
-	logger: Logger;
-	addPackage(name: string, info: Package, callback: Callback): void;
-	removePackage(name: string, callback: Callback): void;
-	updateVersions(name: string, packageInfo: Package, callback: Callback): void;
-	addVersion(name: string, version: string, metadata: Version, tag: StringValue, callback: Callback): void;
-	mergeTags(name: string, tags: MergeTags, callback: Callback): void;
-	changePackage(name: string, metadata: Package, revision: string, callback: Callback): void;
-	removeTarball(name: string, filename: string, revision: string, callback: Callback): void;
-	addTarball(name: string, filename: string): IUploadTarball;
-	getTarball(name: string, filename: string): IReadTarball;
-	getPackageMetadata(name: string, callback: Callback): void;
-	search(startKey: string, options: any): IUploadTarball;
+export type Profile = {
+  tfa: boolean;
+  name: string;
+  email: string;
+  email_verified: string;
+  created: string;
+  updated: string;
+  cidr_whitelist: any;
+  fullname: string;
 }
 
 export type $RequestExtend = $Request & {remote_user?: any}
 export type $ResponseExtend = $Response & {cookies?: any}
 export type $NextFunctionVer = NextFunction & mixed;
 export type $SidebarPackage = Package & {latest: mixed}
+
+
+export interface IAuthWebUI {
+  jwtEncrypt(user: RemoteUser, signOptions: JWTSignOptions): string;
+  aesEncrypt(buf: Buffer): Buffer;
+}
+
+interface IAuthMiddleware {
+  apiJWTmiddleware(): $NextFunctionVer;
+  webUIJWTmiddleware(): $NextFunctionVer;
+}
+
+export interface IAuth extends IBasicAuth, IAuthMiddleware, IAuthWebUI {
+  config: verdaccio$Config;
+  logger: verdaccio$Logger;
+  secret: string;
+  plugins: Array<any>;
+}
+
+export interface IWebSearch {
+  index: lunrMutable.index;
+  storage: IStorageHandler;
+  query(query: string): any;
+  add(pkg: Version): void;
+  remove(name: string): void;
+  reindex(): void;
+  configureStorage(storage: IStorageHandler): void;
+}
+
+export interface IProxy {
+  config: UpLinkConf;
+  failed_requests: number;
+  userAgent: string;
+  ca?: string | void;
+  logger: Logger;
+  server_id: string;
+  url: any;
+  maxage: number;
+  timeout: number;
+  max_fails: number;
+  fail_timeout: number;
+  upname: string;
+  fetchTarball(url: string): IReadTarball;
+  isUplinkValid(url: string): boolean;
+  getRemoteMetadata(name: string, options: any, callback: Callback): void;
+}
+
+export interface IStorage extends IBasicStorage {
+  config: Config;
+  localData: ILocalData;
+  logger: Logger;
+}
+
+export type IGetPackageOptions = {
+  callback: Callback;
+  name: string;
+  keepUpLinkData: boolean;
+  uplinksLook: boolean;
+  req: any;
+}
+
+export type ISyncUplinks = {
+  uplinksLook?: boolean;
+  etag?: string;
+}
+
+export interface IStorageHandler extends IStorageManager {
+  localStorage: IStorage;
+  uplinks: ProxyList;
+  _syncUplinksMetadata(name: string, packageInfo: Package, options: any, callback: Callback): void;
+  _updateVersionsHiddenUpLink(versions: Versions, upLink: IProxy): void;
+}
+
+/**
+ * @property { string | number | Styles }  [ruleOrSelector]
+ */
+export type Styles = {
+  [ruleOrSelector: string]: string | number | Styles,
+};

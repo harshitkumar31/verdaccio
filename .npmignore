@@ -1,13 +1,42 @@
-node_modules
+
+## npm
 npm-debug.log
-coverage/
+yarn-error.log
+node_modules
 verdaccio-*.tgz
-test-storage*
+docker-compose.yaml
+Dockerfile
+crowdin.yaml
 scripts/
-docs/
-src/webui
-tools/
+src/
 /.*
-website/
-assets/
 .vscode/
+.circleci/
+debug/
+
+
+## assets and website
+assets/
+
+## docs
+docs/
+wiki/
+
+## flow
+flow-typed/
+types/
+
+# jest
+coverage/
+test-storage*
+test/
+__mocks__/
+jestEnvironment.js
+test/jest.e2e.config.js
+test/jest.config.functional.js
+jest.config.js
+
+# misc
+contrib/
+storage_default_storage/
+docker-bin/

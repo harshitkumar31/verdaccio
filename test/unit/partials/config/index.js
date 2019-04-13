@@ -1,44 +1,12 @@
 
+import _ from 'lodash';
 import path from 'path';
+import {parseConfigFile} from '../../../../src/lib/utils';
 
-const config = {
-  storage: path.join(__dirname, '../store/test-storage'),
-  uplinks: {
-    'npmjs': {
-      'url': 'https://registry.npmjs.org/'
-    }
-  },
-  packages: {
-    '@*/*': {
-      allow_access: '$all',
-      allow_publish: '$all',
-      proxy: 'npmjs'
-    },
 
-    'forbidden-place': {
-      allow_access: 'nobody',
-      allow_publish: '$all'
-    },
-
-    'react': {
-      allow_access: '$all',
-      allow_publish: '$all',
-      proxy: 'npmjs'
-    },
-
-    'jquery': {
-      allow_access: '$all',
-      allow_publish: '$all',
-      proxy: 'npmjs'
-    },
-    '*': {
-      allow_access: '$all',
-      allow_publish: '$all'
-    },
-  },
-  logs: [
-    {type: 'stdout', format: 'pretty', level: 'fatal'},
-  ],
-};
-
-module.exports = config;
+export default (options, url = 'default.yaml') => {
+  const locationFile = path.join(__dirname, `../config/yaml/${url}`);
+  const config = parseConfigFile(locationFile);
+  
+  return _.assign({}, _.cloneDeep(config), options);
+}
